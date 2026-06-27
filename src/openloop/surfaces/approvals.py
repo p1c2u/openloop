@@ -52,15 +52,21 @@ def approval_blocks(requests: list[ApprovalRequest]) -> list[dict]:
     return blocks
 
 
-async def resolve_from_action(
-    gateway: ToolGateway, approval_id: str, approver: str, *, approve: bool
-) -> str:
-    """Resolve an approval from a button click; return a status message."""
-    inv = await gateway.resolve(approval_id, approver, approve=approve)
+def resolution_message(inv, approver: str) -> str:
+    """Status line for a resolved approval — shared by the button reply and the
+    session continuation so they never drift."""
     if inv.status == "executed":
-        detail = inv.result.summary if inv.result else "done"
+        detail = inv.result.summary if inv.result else (inv.message or "done")
         return f"✅ Approved by {approver} — {detail}"
     if inv.status == "denied":
         return f"🚫 Denied by {approver}."
     # forbidden (not an approver / unknown / already resolved)
     return f"⛔ {inv.message}"
+
+
+async def resolve_from_action(
+    gateway: ToolGateway, approval_id: str, approver: str, *, approve: bool
+) -> str:
+    """Resolve an approval from a button click; return a status message."""
+    inv = await gateway.resolve(approval_id, approver, approve=approve)
+    return resolution_message(inv, approver)

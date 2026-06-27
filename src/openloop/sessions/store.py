@@ -80,6 +80,8 @@ class SurfaceSessionStore(Protocol):
 
     async def get_by_event(self, event_id: str) -> SurfaceSession | None: ...
 
+    async def get_by_approval(self, approval_id: str) -> SurfaceSession | None: ...
+
     async def upsert(self, session: SurfaceSession) -> None: ...
 
     async def recent(self, limit: int = 100) -> list[SurfaceSession]: ...
@@ -102,6 +104,16 @@ class InMemorySurfaceSessionStore:
             self._by_id.values(), key=lambda s: s.created_at, reverse=True
         ):
             if session.target.event_id == event_id:
+                return session
+        return None
+
+    async def get_by_approval(self, approval_id: str) -> SurfaceSession | None:
+        if not approval_id:
+            return None
+        for session in sorted(
+            self._by_id.values(), key=lambda s: s.updated_at, reverse=True
+        ):
+            if approval_id in session.approval_ids:
                 return session
         return None
 

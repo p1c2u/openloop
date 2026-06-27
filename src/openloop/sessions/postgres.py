@@ -58,6 +58,11 @@ class PostgresSurfaceSessionStore:
                 "CREATE UNIQUE INDEX IF NOT EXISTS surface_sessions_event_uniq "
                 "ON surface_sessions (event_id) WHERE event_id IS NOT NULL"
             )
+            # GIN index backs the `approval_ids ? $1` lookup (button → session).
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS surface_sessions_approval_idx "
+                "ON surface_sessions USING GIN (approval_ids)"
+            )
 
     async def close(self) -> None:
         if self._pool is not None:
@@ -88,6 +93,20 @@ class PostgresSurfaceSessionStore:
                 "SELECT * FROM surface_sessions WHERE event_id = $1 "
                 "ORDER BY created_at DESC LIMIT 1",
                 event_id,
+            )
+        return _row_to_session(row) if row else None
+
+    async def get_by_approval(self, approval_id: str) -> SurfaceSession | None:
+        if not approval_id:
+            return None
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            # `@>` (JSONB containment) tests that the array holds this id. Unlike
+            # the `?` operator it takes a normal $1 param and is GIN-indexable.
+            row = await conn.fetchrow(
+                "SELECT * FROM surface_sessions WHERE approval_ids @> $1::jsonb "
+                "ORDER BY updated_at DESC LIMIT 1",
+                json.dumps([approval_id]),
             )
         return _row_to_session(row) if row else None
 

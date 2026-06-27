@@ -264,3 +264,56 @@ async def test_workflow_resume_across_real_postgres():
         except Exception:
             pass
         await store.close()
+
+
+async def test_surface_session_roundtrip_across_real_postgres():
+    """Persist a surface session and look it up by event + approval id (Phase D)."""
+    if not await _reachable():
+        pytest.skip(f"no Postgres reachable at {DSN}")
+
+    from openloop.sessions.postgres import PostgresSurfaceSessionStore
+    from openloop.sessions.store import SurfaceSession, SurfaceTarget
+
+    session_id = f"sess-{uuid.uuid4().hex[:8]}"
+    event_id = f"ev-{uuid.uuid4().hex[:8]}"
+    approval_id = f"appr-{uuid.uuid4().hex[:8]}"
+
+    store = PostgresSurfaceSessionStore(DSN)
+    await store.setup()
+    try:
+        await store.upsert(SurfaceSession(
+            id=session_id,
+            target=SurfaceTarget(
+                surface="slack", workspace="acme", agent="dev-platform",
+                channel="C1", thread="100.1", event_id=event_id,
+            ),
+            status="waiting",
+            workflow_instance_id=session_id,
+            progress_message_id="ts-1",
+            approval_ids=[approval_id],
+        ))
+
+        # A fresh store (a restart) reads it back by all three keys.
+        store2 = PostgresSurfaceSessionStore(DSN)
+        await store2.setup()
+        try:
+            by_id = await store2.get(session_id)
+            assert by_id is not None and by_id.status == "waiting"
+            assert by_id.target.thread == "100.1"
+            assert by_id.approval_ids == [approval_id]
+            assert (await store2.get_by_event(event_id)).id == session_id
+            # The `@>` containment lookup (button → session) resolves the owner.
+            assert (await store2.get_by_approval(approval_id)).id == session_id
+            assert await store2.get_by_approval("nope") is None
+        finally:
+            await store2.close()
+    finally:
+        try:
+            pool = store._require_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM surface_sessions WHERE id = $1", session_id
+                )
+        except Exception:
+            pass
+        await store.close()

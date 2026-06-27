@@ -31,6 +31,7 @@ import uuid
 from openloop.runtime import Runtime, Task
 from openloop.sessions.delivery import SurfaceDelivery
 from openloop.sessions.store import (
+    TERMINAL,
     SurfaceSession,
     SurfaceSessionStore,
     SurfaceTarget,
@@ -130,6 +131,72 @@ class SessionRunner:
         await self.sessions.upsert(session)
         await self._post_final(session, session.result_summary)
         return session
+
+    async def resolve_approval(
+        self, approval_id: str, approver: str, *, approve: bool
+    ) -> str:
+        """Resolve an approval and continue the session that was waiting on it.
+
+        Resolves the approval through the tool gateway (which executes the write /
+        wakes its workflow), then — if a session is parked on this approval —
+        posts the outcome as the final answer in the original thread and closes
+        the session. Returns the status line for the button-click reply.
+
+        Delivery failures never block the button reply and always leave the
+        session in a repairable state: a session left ``waiting`` retries the
+        whole continuation on the next click; one already flipped terminal but
+        not yet delivered is repaired idempotently from its persisted outcome. So
+        even if the tool side effect succeeds but a Slack post fails, a second
+        click (or the startup reconciler) still delivers the answer.
+        """
+        from openloop.surfaces.approvals import resolution_message
+
+        tools = getattr(self.runtime, "tools", None)
+        if tools is None:
+            return "⛔ approvals are not available"
+        inv = await tools.resolve(approval_id, approver, approve=approve)
+        message = resolution_message(inv, approver)
+
+        session = await self.sessions.get_by_approval(approval_id)
+        if session is not None:
+            try:
+                if session.status == "waiting":
+                    await self._continue_session(session, inv, approver, message)
+                elif session.status in TERMINAL and session.final_message_id is None:
+                    # A prior continuation flipped the session terminal but a Slack
+                    # post failed before the answer landed — re-deliver it from the
+                    # persisted outcome (idempotent; reuses result_summary).
+                    await self._ensure_delivered(session)
+            except Exception:  # noqa: BLE001 — leave it repairable, still reply
+                logger.exception(
+                    "failed to deliver approval outcome for session %s", session.id
+                )
+        return message
+
+    async def _continue_session(
+        self, session: SurfaceSession, inv, approver: str, message: str
+    ) -> None:
+        """Post a resolved approval's outcome in-thread and close the session."""
+        if inv.status == "executed":
+            detail = inv.result.summary if inv.result else (inv.message or "done")
+            final_text = detail
+        elif inv.status == "denied":
+            final_text = f"🚫 Denied by {approver}."
+        else:  # forbidden / not-an-approver / already resolved — leave it parked
+            return
+        # Persist the outcome (so a failed post is repairable from result_summary),
+        # then deliver the ANSWER first — the approval card collapse is cosmetic and
+        # must never block or lose the final reply.
+        session.status = "completed"
+        session.result_summary = final_text
+        await self.sessions.upsert(session)
+        await self._post_final(session, final_text)
+        try:
+            await self._update_approval(session, message, [])
+        except Exception:  # noqa: BLE001 — buttons going stale is cosmetic
+            logger.exception(
+                "failed to collapse approval card for session %s", session.id
+            )
 
     async def _ensure_delivered(self, session: SurfaceSession) -> SurfaceSession:
         """Re-deliver an existing session's answer if it crashed before posting.

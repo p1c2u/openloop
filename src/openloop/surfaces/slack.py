@@ -24,11 +24,7 @@ from openloop.sessions import (
     SurfaceSessionStore,
     SurfaceTarget,
 )
-from openloop.surfaces.approvals import (
-    APPROVE_ACTION,
-    DENY_ACTION,
-    resolve_from_action,
-)
+from openloop.surfaces.approvals import APPROVE_ACTION, DENY_ACTION
 
 logger = logging.getLogger(__name__)
 
@@ -119,8 +115,10 @@ def build_slack_app(
         if runtime.tools is None:
             return
         approver = _approver_handle(body.get("user", {}))
-        message = await resolve_from_action(
-            runtime.tools, action["value"], approver, approve=approve
+        # The runner resolves the approval *and* continues the owning session,
+        # posting the eventual answer back in the original thread.
+        message = await runner.resolve_approval(
+            action["value"], approver, approve=approve
         )
         await respond(text=message, replace_original=False)
 

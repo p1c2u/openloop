@@ -47,9 +47,9 @@ def _task(text="hi"):
     return Task(text=text, surface="slack", channel="C1", user="U1")
 
 
-def _runner(model_gateway, *, tools=None):
+def _runner(model_gateway, *, tools=None, delivery=None):
     sessions = InMemorySurfaceSessionStore()
-    delivery = FakeSurfaceDelivery()
+    delivery = delivery or FakeSurfaceDelivery()
     engine = WorkflowEngine(InMemoryWorkflowStore())
     runtime = Runtime(
         load_agent(EXAMPLE_AGENT),
@@ -151,6 +151,109 @@ async def test_pending_approval_parks_session_waiting():
     assert len(delivery.approvals) == 1
     assert [r.id for r in delivery.approvals[0]["requests"]] == session.approval_ids
     assert github.created == []  # write not executed
+
+
+def _waiting_runner(*, delivery=None):
+    """A runner whose session is parked on a github write approval."""
+    github = FakeGitHub()
+    tools = ToolGateway(tools=[GitHubConnector(github)])
+    runner, sessions, delivery = _runner(
+        ScriptedGateway([
+            tool_call_response(
+                "m", [("c1", "github_issues_write", {"repo": "acme/x", "title": "T"})]
+            ),
+        ]),
+        tools=tools,
+        delivery=delivery,
+    )
+    return runner, sessions, delivery, github
+
+
+# --- runner: approval continuation (Slice 4) ----------------------------
+
+async def test_approve_continues_session_and_posts_outcome_in_thread():
+    runner, sessions, delivery, github = _waiting_runner()
+    session = await runner.run(_task("open an issue"), _target())
+    approval_id = session.approval_ids[0]
+
+    message = await runner.resolve_approval(approval_id, "@priya", approve=True)
+
+    assert message.startswith("✅ Approved by @priya")
+    assert github.created  # the write executed on approval
+    # The outcome is delivered as the final answer in the original thread.
+    assert len(delivery.finals) == 1
+    assert delivery.finals[0]["target"].thread == "100.1"
+    # The session is now completed and the approval card was collapsed (no buttons).
+    done = await sessions.get(session.id)
+    assert done.status == "completed"
+    assert done.final_message_id is not None
+    assert delivery.approvals[-1]["requests"] == []
+
+
+async def test_deny_continues_session_without_executing():
+    runner, sessions, delivery, github = _waiting_runner()
+    session = await runner.run(_task("open an issue"), _target())
+
+    message = await runner.resolve_approval(
+        session.approval_ids[0], "@priya", approve=False
+    )
+
+    assert message.startswith("🚫 Denied")
+    assert github.created == []
+    done = await sessions.get(session.id)
+    assert done.status == "completed"
+    assert "Denied" in delivery.finals[-1]["text"]
+
+
+async def test_non_approver_leaves_session_waiting():
+    runner, sessions, delivery, github = _waiting_runner()
+    session = await runner.run(_task("open an issue"), _target())
+
+    message = await runner.resolve_approval(
+        session.approval_ids[0], "@random", approve=True
+    )
+
+    assert message.startswith("⛔")
+    assert github.created == []
+    # The session stays parked; no final answer posted.
+    assert (await sessions.get(session.id)).status == "waiting"
+    assert delivery.finals == []
+
+
+async def test_failed_outcome_delivery_is_repaired_on_second_click():
+    # The write succeeds but the Slack post_final fails the first time. The session
+    # is left terminal-without-final; a second click must re-deliver the answer
+    # (and never re-execute the write), rather than the user getting nothing.
+    class FlakyDelivery(FakeSurfaceDelivery):
+        def __init__(self):
+            super().__init__()
+            self.fail_finals = 1
+
+        async def post_final(self, target, text, *, blocks=None):
+            if self.fail_finals > 0:
+                self.fail_finals -= 1
+                raise RuntimeError("slack down")
+            return await super().post_final(target, text, blocks=blocks)
+
+    runner, sessions, delivery, github = _waiting_runner(delivery=FlakyDelivery())
+    session = await runner.run(_task("open an issue"), _target())
+    approval_id = session.approval_ids[0]
+
+    # First click: write executes, but delivering the answer fails (swallowed).
+    msg1 = await runner.resolve_approval(approval_id, "@priya", approve=True)
+    assert msg1.startswith("✅ Approved by @priya")
+    assert len(github.created) == 1
+    stuck = await sessions.get(session.id)
+    assert stuck.status == "completed" and stuck.final_message_id is None
+    assert delivery.finals == []  # nothing delivered yet
+
+    # Second click: no re-execution, and the persisted outcome is re-delivered.
+    await runner.resolve_approval(approval_id, "@priya", approve=True)
+    assert len(github.created) == 1  # write was not repeated
+    repaired = await sessions.get(session.id)
+    assert repaired.final_message_id is not None
+    assert len(delivery.finals) == 1
+    assert delivery.finals[0]["text"] == repaired.result_summary
 
 
 # --- runner: crash-before-delivery repaired on retry ---------------------
