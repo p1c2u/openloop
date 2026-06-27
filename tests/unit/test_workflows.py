@@ -101,6 +101,62 @@ async def test_resume_incomplete_redrives_running_only():
     assert (await store.get("parked")).status == "waiting"
 
 
+def _two_step_workflow(calls):
+    async def gen(ctx):
+        calls.append("gen")
+
+    async def save(ctx):
+        calls.append("save")
+
+    # gen is non-resumable (e.g. a model call); save is idempotent.
+    return Workflow("t2", [Step("gen", gen, resumable=False), Step("save", save)])
+
+
+async def test_resume_abandons_when_non_resumable_step_pending():
+    from openloop.workflows import WorkflowInstance
+
+    calls: list[str] = []
+    wf = _two_step_workflow(calls)
+    engine, store = _engine(wf)
+    await store.upsert(WorkflowInstance(id="i", workflow="t2", status="running"))
+
+    resumed = await engine.resume_incomplete()
+    assert resumed == []
+    assert (await store.get("i")).status == "abandoned"
+    assert calls == []  # the non-resumable step was never replayed
+
+
+async def test_resume_runs_when_only_resumable_steps_remain():
+    from openloop.workflows import WorkflowInstance
+
+    calls: list[str] = []
+    wf = _two_step_workflow(calls)
+    engine, store = _engine(wf)
+    await store.upsert(WorkflowInstance(
+        id="i", workflow="t2", status="running", completed_steps=["gen"]
+    ))
+
+    resumed = await engine.resume_incomplete()
+    assert resumed == ["i"]
+    assert (await store.get("i")).status == "completed"
+    assert calls == ["save"]  # only the idempotent tail re-ran
+
+
+async def test_start_does_not_redrive_existing_instance():
+    from openloop.workflows import WorkflowInstance
+
+    calls: list[str] = []
+    wf = _two_step_workflow(calls)
+    engine, store = _engine(wf)
+    await store.upsert(WorkflowInstance(
+        id="i", workflow="t2", status="running", completed_steps=["gen"]
+    ))
+
+    inst = await engine.start("t2", "i", {})
+    assert inst.status == "running"  # returned as-is
+    assert calls == []  # never driven into the non-resumable step
+
+
 async def test_cancel_marks_terminal():
     engine, store = _engine()
     await engine.start("t", "i1", {})

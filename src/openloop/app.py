@@ -242,9 +242,12 @@ def create_app() -> FastAPI:
                 log.info("workflow backend: postgres")
             except Exception:
                 log.exception(
-                    "postgres workflow setup failed — durable workflows disabled"
+                    "postgres workflow setup failed — falling back to in-memory"
                 )
-                tools.engine = None
+                # Swap the shared engine's store so BOTH the gateway and the
+                # already-constructed runtime keep working (process-local, not
+                # crash-durable) rather than hitting an un-setup pool.
+                engine.store = InMemoryWorkflowStore()
         else:
             log.info("workflow backend: in-memory (process-local)")
 
@@ -300,7 +303,8 @@ def create_app() -> FastAPI:
     )
     if slack_agent and settings.slack_bot_token:
         runtime = Runtime(
-            slack_agent, memory=store, embedder=embedder, usage=usage, tools=tools
+            slack_agent, memory=store, embedder=embedder, usage=usage,
+            tools=tools, engine=engine,
         )
         app.state.runtime = runtime
         slack_app = build_slack_app(

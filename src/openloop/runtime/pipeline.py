@@ -10,7 +10,9 @@ model produces a final answer. Usage is recorded and the exchange remembered.
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from openloop.agents.schema import Agent
 from openloop.memory import (
@@ -29,6 +31,9 @@ from openloop.usage import (
     budget_scope_key,
     check_budget,
 )
+
+if TYPE_CHECKING:
+    from openloop.workflows.engine import WorkflowContext, WorkflowEngine
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +77,7 @@ class Runtime:
         embedder: Embedder | None = None,
         usage: UsageStore | None = None,
         tools: ToolGateway | None = None,
+        engine: "WorkflowEngine | None" = None,
         *,
         remember: bool = True,
     ) -> None:
@@ -82,6 +88,13 @@ class Runtime:
         self.usage = usage or InMemoryUsageStore()
         self.tools = tools
         self.remember = remember
+        # When an engine is wired, each task runs as a durable `agent_task`
+        # workflow (consumer #2). Namespaced per agent so multiple agents on one
+        # engine don't collide. Without an engine, handle() runs inline.
+        self.engine = engine
+        self.workflow_name = f"agent_task:{agent.metadata.name}"
+        if engine is not None:
+            engine.register(self._build_workflow())
 
     def _build_messages(
         self, task: Task, recalled: list[MemoryRecord]
@@ -113,64 +126,164 @@ class Runtime:
         return vectors[0] if vectors else None
 
     async def handle(self, task: Task) -> ModelResponse:
+        if self.engine is not None:
+            return await self._handle_workflow(task)
+        return await self._handle_inline(task)
+
+    async def _handle_inline(self, task: Task) -> ModelResponse:
+        """Run the pipeline directly (no durable workflow)."""
+        model, scope, messages, query_embedding, block_reason = await self._prepare(task)
+        if block_reason is not None:
+            await self._record_usage(
+                task, model, ModelResponse(text="", model=model), outcome="blocked"
+            )
+            return _blocked_response(block_reason)
+
+        final_text, accounted, approval_ids = await self._run_tool_loop(
+            model, messages, task
+        )
+        if self.remember:
+            await self._remember(task, scope, query_embedding)
+        outcome = self._task_outcome(accounted)
+        await self._record_usage(task, model, accounted, outcome=outcome)
+        self._log_completion(task, accounted, outcome)
+        return _final_response(final_text, accounted, approval_ids, model)
+
+    # --- shared phases (used by both the inline and workflow paths) ---
+
+    async def _prepare(
+        self, task: Task
+    ) -> tuple[str, str, list[dict] | None, list[float] | None, str | None]:
+        """Resolve model, enforce budget, recall memory, build messages.
+
+        Returns ``(model, scope, messages, query_embedding, block_reason)``;
+        a non-None ``block_reason`` means the budget guard tripped (no model call).
+        """
         model = self.agent.model_for(task.kind)
         scope = scope_key_for(self.agent, task.channel)
         logger.info("routing task on %s/%s -> %s", task.surface, task.channel, model)
 
-        # Budget: gate on accumulated monthly spend before any model call.
         decision = await check_budget(self.agent, self.usage)
         if not decision.allowed:
             logger.warning("blocked task for %s: %s", scope, decision.reason)
-            await self._record_usage(task, model, ModelResponse(text="", model=model),
-                                     outcome="blocked")
-            return ModelResponse(
-                text=f"💸 Budget guard: {decision.reason}. Action blocked.",
-                model="budget-guard",
-            )
+            return model, scope, None, None, decision.reason
 
-        # Recall: embed the request once and reuse the vector when remembering.
+        # Embed the request once and reuse the vector when remembering.
         query_embedding = await self._embed(task.text)
-        recalled = await self.memory.recall(
-            scope, query_embedding, limit=RECALL_LIMIT
-        )
+        recalled = await self.memory.recall(scope, query_embedding, limit=RECALL_LIMIT)
         if recalled:
             logger.info("recalled %d memory item(s) for %s", len(recalled), scope)
-
         messages = self._build_messages(task, recalled)
-        final_text, accounted, approval_ids = await self._run_tool_loop(
-            model, messages, task
+        return model, scope, messages, query_embedding, None
+
+    async def _remember(
+        self, task: Task, scope: str, query_embedding: list[float] | None
+    ) -> None:
+        await self.memory.remember(
+            MemoryRecord(
+                scope_key=scope,
+                text=task.text,
+                kind="message",
+                metadata={"user": task.user or "", "surface": task.surface},
+                embedding=query_embedding,
+            )
         )
 
-        if self.remember:
-            await self.memory.remember(
-                MemoryRecord(
-                    scope_key=scope,
-                    text=task.text,
-                    kind="message",
-                    metadata={"user": task.user or "", "surface": task.surface},
-                    embedding=query_embedding,
-                )
-            )
-
-        outcome = self._task_outcome(accounted)
-        await self._record_usage(task, model, accounted, outcome=outcome)
+    def _log_completion(
+        self, task: Task, accounted: ModelResponse, outcome: str
+    ) -> None:
         logger.info(
             "completed task on %s/%s with %s (%d+%d tok, $%.4f, %s)",
-            task.surface,
-            task.channel,
-            accounted.model,
-            accounted.prompt_tokens,
-            accounted.completion_tokens,
-            accounted.cost_usd,
-            outcome,
+            task.surface, task.channel, accounted.model,
+            accounted.prompt_tokens, accounted.completion_tokens,
+            accounted.cost_usd, outcome,
         )
-        return ModelResponse(
-            text=final_text,
-            model="approval-gate" if approval_ids else accounted.model,
-            prompt_tokens=accounted.prompt_tokens,
-            completion_tokens=accounted.completion_tokens,
-            cost_usd=accounted.cost_usd,
-            approval_ids=approval_ids,
+
+    # --- durable workflow path (consumer #2) ---
+
+    def _build_workflow(self):
+        # Imported here to avoid a cycle (engine has no runtime dependency).
+        from openloop.workflows.engine import Step, Workflow
+
+        return Workflow(
+            self.workflow_name,
+            [
+                Step("prepare", self._wf_prepare),
+                # Model calls aren't idempotent: a crash before `run` completes is
+                # abandoned (not replayed); once `run` is done, the idempotent
+                # `persist` tail can still resume.
+                Step("run", self._wf_run, resumable=False),
+                Step("persist", self._wf_persist),
+            ],
+        )
+
+    async def _handle_workflow(self, task: Task) -> ModelResponse:
+        instance = await self.engine.start(
+            self.workflow_name, uuid.uuid4().hex, {"task": _task_to_dict(task)}
+        )
+        return self._response_from(instance)
+
+    async def _wf_prepare(self, ctx: "WorkflowContext") -> None:
+        task = _task_from_dict(ctx.state["task"])
+        model, scope, messages, query_embedding, block_reason = await self._prepare(task)
+        ctx.state.update({"model": model, "scope": scope})
+        if block_reason is not None:
+            ctx.state.update({"blocked": True, "block_reason": block_reason})
+            return
+        # Persisted turn state: messages (system+history+user), recall vector.
+        ctx.state.update({"messages": messages, "query_embedding": query_embedding})
+
+    async def _wf_run(self, ctx: "WorkflowContext") -> None:
+        s = ctx.state
+        if s.get("blocked"):
+            return
+        task = _task_from_dict(s["task"])
+        final_text, accounted, approval_ids = await self._run_tool_loop(
+            s["model"], s["messages"], task
+        )
+        # Persist received model outputs + tool-loop state + approvals.
+        s["messages"] = s["messages"]  # mutated in place by the loop
+        s["final_text"] = final_text
+        s["accounted"] = _resp_to_dict(accounted)
+        s["approval_ids"] = approval_ids
+
+    async def _wf_persist(self, ctx: "WorkflowContext") -> None:
+        s = ctx.state
+        task = _task_from_dict(s["task"])
+        if s.get("blocked"):
+            if not s.get("usage_recorded"):
+                await self._record_usage(
+                    task, s["model"], ModelResponse(text="", model=s["model"]),
+                    outcome="blocked",
+                )
+                s["usage_recorded"] = True
+            return
+
+        accounted = _resp_from_dict(s["accounted"])
+        # Idempotent writes: flags guard against a resumed persist double-writing.
+        if self.remember and not s.get("remembered"):
+            await self._remember(task, s["scope"], s.get("query_embedding"))
+            s["remembered"] = True
+            await self.engine.checkpoint(ctx.instance)
+        if not s.get("usage_recorded"):
+            outcome = self._task_outcome(accounted)
+            await self._record_usage(task, s["model"], accounted, outcome=outcome)
+            s["usage_recorded"] = True
+            self._log_completion(task, accounted, outcome)
+
+    def _response_from(self, instance) -> ModelResponse:
+        s = instance.state
+        if s.get("blocked"):
+            return _blocked_response(s["block_reason"])
+        if instance.status in ("failed", "abandoned"):
+            return ModelResponse(
+                text="⚠️ This task was interrupted and could not be completed.",
+                model="error",
+            )
+        accounted = _resp_from_dict(s.get("accounted", {}))
+        return _final_response(
+            s.get("final_text", ""), accounted, s.get("approval_ids", []),
+            s.get("model", accounted.model),
         )
 
     async def _run_tool_loop(
@@ -285,3 +398,67 @@ class Runtime:
                 outcome=outcome,
             )
         )
+
+
+def _blocked_response(reason: str) -> ModelResponse:
+    return ModelResponse(
+        text=f"💸 Budget guard: {reason}. Action blocked.", model="budget-guard"
+    )
+
+
+def _final_response(
+    final_text: str,
+    accounted: ModelResponse,
+    approval_ids: list[str],
+    model: str,
+) -> ModelResponse:
+    return ModelResponse(
+        text=final_text,
+        model="approval-gate" if approval_ids else (accounted.model or model),
+        prompt_tokens=accounted.prompt_tokens,
+        completion_tokens=accounted.completion_tokens,
+        cost_usd=accounted.cost_usd,
+        approval_ids=approval_ids,
+    )
+
+
+def _task_to_dict(task: Task) -> dict:
+    return {
+        "text": task.text,
+        "surface": task.surface,
+        "channel": task.channel,
+        "user": task.user,
+        "kind": task.kind,
+        "history": task.history,
+    }
+
+
+def _task_from_dict(data: dict) -> Task:
+    return Task(
+        text=data["text"],
+        surface=data["surface"],
+        channel=data.get("channel"),
+        user=data.get("user"),
+        kind=data.get("kind"),
+        history=data.get("history", []),
+    )
+
+
+def _resp_to_dict(response: ModelResponse) -> dict:
+    return {
+        "text": response.text,
+        "model": response.model,
+        "prompt_tokens": response.prompt_tokens,
+        "completion_tokens": response.completion_tokens,
+        "cost_usd": response.cost_usd,
+    }
+
+
+def _resp_from_dict(data: dict) -> ModelResponse:
+    return ModelResponse(
+        text=data.get("text", ""),
+        model=data.get("model", ""),
+        prompt_tokens=data.get("prompt_tokens", 0),
+        completion_tokens=data.get("completion_tokens", 0),
+        cost_usd=data.get("cost_usd", 0.0),
+    )

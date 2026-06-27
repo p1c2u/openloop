@@ -201,12 +201,13 @@ spec:
 | Layer | Now | Later |
 | --- | --- | --- |
 | API / backend | FastAPI | — |
-| Agent runtime | async task pipeline + durable workflow engine | migrate the chat/tool loop onto the engine |
+| Agent runtime | durable workflow engine (worker + chat pipeline as workflows) | model-call replay/caching semantics; retry policies |
 | Model gateway | LiteLLM | routing analytics |
 | Tools | MCP gateway + native GitHub/Slack | more native connectors |
 | Storage | Postgres + pgvector | — |
 | Queue | Redis | — |
 | Surfaces | Slack | Discord / Zoom / GitHub / Linear |
+| Delivery | inline Slack replies + approval responses | persisted sessions, progress updates, resume after approvals/replies, final postbacks |
 | Coding worker | draft PRs (clone → edit → push) | OpenHands-style |
 | Dashboard | — | Next.js |
 | Observability | — | OpenTelemetry / Langfuse traces |
@@ -348,8 +349,12 @@ the workflow.
 - [x] Docker Compose + config-as-code
 - [ ] Discord / Zoom / GitHub / Linear surfaces
 - [x] Coding worker (draft PRs) — connector + approval gate + crash-resumable
-- [x] Durable workflows — engine + approval-as-wait-node; worker runs as a workflow
-- [ ] Migrate the chat/tool loop onto the workflow engine
+- [x] Durable workflows — engine + approval-as-wait-node; worker resumes on crash;
+  chat pipeline runs as a workflow (bounded: persisted turn state + idempotent
+  writes; model calls are not replayed on crash)
+- [ ] Fully durable chat turns — async surface delivery/session runner (persist
+  surface targets, post progress, resume after approvals/thread replies, deliver
+  outside the original request lifecycle) + a model-call replay/caching policy
 - [ ] Next.js dashboard, OTel/Langfuse tracing
 
 ## Scope

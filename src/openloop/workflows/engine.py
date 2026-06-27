@@ -47,11 +47,18 @@ StepFn = Callable[[WorkflowContext], Awaitable[None]]
 
 @dataclass(slots=True)
 class Step:
-    """One named step. ``wait`` nodes park the instance until an event arrives."""
+    """One named step. ``wait`` nodes park the instance until an event arrives.
+
+    ``resumable=False`` marks a step that must not be replayed (e.g. a chat turn's
+    non-idempotent model call). A crash is recoverable only once every
+    non-resumable step has completed; before that the instance is abandoned rather
+    than re-driven into the non-resumable step. Idempotent steps stay resumable.
+    """
 
     name: str
     run: StepFn | None = None
     wait: bool = False
+    resumable: bool = True
 
 
 @dataclass(slots=True)
@@ -72,14 +79,23 @@ class WorkflowEngine:
     def register(self, workflow: Workflow) -> None:
         self.workflows[workflow.name] = workflow
 
+    async def checkpoint(self, instance: WorkflowInstance) -> None:
+        """Persist mid-step state (e.g. after an idempotent write inside a step)."""
+        await self.store.upsert(instance)
+
     async def start(
         self, workflow: str, instance_id: str, initial_state: dict
     ) -> WorkflowInstance:
-        """Start (or no-op resume of) an instance and drive it to its first park."""
+        """Create a new instance and drive it to its first park/terminal.
+
+        Idempotent on the instance id: if one already exists it is returned
+        as-is, never re-driven — that could replay a non-resumable step. Resuming
+        is the job of :meth:`send_event` (waits) and :meth:`resume_incomplete`
+        (crashes), which both apply the resumability rules.
+        """
         existing = await self.store.get(instance_id)
         if existing is not None:
-            # Idempotent start: a retry of the same id resumes, never restarts.
-            return await self._drive(existing)
+            return existing
         instance = WorkflowInstance(
             id=instance_id, workflow=workflow, state=dict(initial_state)
         )
@@ -124,10 +140,22 @@ class WorkflowEngine:
         """
         resumed: list[str] = []
         for instance in await self.store.recent(limit=1000):
-            if instance.status == "running":
-                logger.info("resuming workflow %s (%s)", instance.id, instance.workflow)
-                await self._drive(instance)
-                resumed.append(instance.id)
+            if instance.status != "running":
+                continue
+            workflow = self.workflows.get(instance.workflow)
+            if workflow is None:
+                # Its workflow isn't registered in this process; leave it be.
+                continue
+            if _has_pending_non_resumable_step(workflow, instance):
+                # A non-resumable step (e.g. a chat turn's model call) hasn't
+                # completed — resuming would replay it. Abandon instead.
+                instance.status = "abandoned"
+                instance.error = "interrupted before a non-resumable step completed"
+                await self.store.upsert(instance)
+                continue
+            logger.info("resuming workflow %s (%s)", instance.id, instance.workflow)
+            await self._drive(instance)
+            resumed.append(instance.id)
         return resumed
 
     async def _drive(self, instance: WorkflowInstance) -> WorkflowInstance:
@@ -162,3 +190,17 @@ class WorkflowEngine:
         instance.status = "completed"
         await self.store.upsert(instance)
         return instance
+
+
+def _has_pending_non_resumable_step(
+    workflow: Workflow, instance: WorkflowInstance
+) -> bool:
+    """True if a non-resumable step has not yet completed.
+
+    Once every non-resumable step is done, only idempotent steps remain and the
+    instance is safe to re-drive on resume.
+    """
+    done = set(instance.completed_steps)
+    return any(
+        not step.resumable and step.name not in done for step in workflow.steps
+    )

@@ -15,8 +15,9 @@ from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 
 # Terminal statuses never resume; "running" resumes on startup (crashed mid-step);
-# "waiting" stays parked until an event wakes it.
-TERMINAL = ("completed", "failed", "cancelled")
+# "waiting" stays parked until an event wakes it. "abandoned" is a crashed run of
+# a non-resumable workflow (e.g. a chat turn — we never replay paid model calls).
+TERMINAL = ("completed", "failed", "cancelled", "abandoned")
 
 
 def _now() -> datetime:
