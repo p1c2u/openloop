@@ -173,6 +173,58 @@ class SessionRunner:
                 )
         return message
 
+    async def reconcile(self) -> list[str]:
+        """Repair delivery state for sessions left mid-flight by a crash.
+
+        Call once at startup, **after** the workflow engine's own
+        ``resume_incomplete`` has driven crashed turns to a terminal state. For
+        each session:
+
+        - ``waiting`` (parked on a human approval) or already-delivered → leave
+          it alone;
+        - terminal but with no final message (the turn finished but a Slack post
+          failed, or it crashed between the status flip and the post) →
+          re-deliver from the persisted outcome;
+        - still ``queued`` / ``running`` (the turn crashed before it was
+          delivered) → recover the answer from the now-terminal workflow instance
+          and deliver it, or post an interrupted notice if it can't be recovered.
+
+        Single-runtime assumption — no cross-process lock yet (Redis later).
+        """
+        repaired: list[str] = []
+        for session in await self.sessions.recent(limit=1000):
+            if session.status == "waiting" or session.final_message_id is not None:
+                continue
+            if session.status in TERMINAL:
+                await self._ensure_delivered(session)
+                repaired.append(session.id)
+                continue
+            # queued / running — recover from the workflow the session is bound to.
+            found, response = await self._recover(session)
+            if response is not None:
+                await self._deliver(session, response)
+            elif not found:
+                # No recoverable workflow (missing instance / no engine) → notice.
+                session.status = "abandoned"
+                session.error = ERROR_TEXT
+                await self.sessions.upsert(session)
+                await self._post_error(session)
+            else:
+                # The workflow exists but isn't terminal yet — leave it for a later
+                # restart rather than delivering a half-finished turn.
+                continue
+            repaired.append(session.id)
+        return repaired
+
+    async def _recover(self, session: SurfaceSession) -> tuple[bool, object]:
+        """``(found, response)`` for a session's workflow — see
+        :meth:`Runtime.recover_response`."""
+        instance_id = session.workflow_instance_id
+        recover = getattr(self.runtime, "recover_response", None)
+        if instance_id is None or recover is None:
+            return False, None
+        return await recover(instance_id)
+
     async def _continue_session(
         self, session: SurfaceSession, inv, approver: str, message: str
     ) -> None:

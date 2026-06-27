@@ -301,6 +301,16 @@ def create_app() -> FastAPI:
                 log.exception("workflow resume failed")
         await _resume_worker_jobs(tools)
 
+        # Repair surface-session delivery left mid-flight by a crash — runs after
+        # the engine resume above so each session's workflow is already terminal.
+        if session_runner is not None:
+            try:
+                repaired = await session_runner.reconcile()
+                if repaired:
+                    log.info("reconciled %d surface session(s)", len(repaired))
+            except Exception:
+                log.exception("surface-session reconcile failed")
+
         for connector in getattr(tools, "mcp_connectors", []):
             try:
                 await connector.setup()

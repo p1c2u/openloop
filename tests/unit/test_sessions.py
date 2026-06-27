@@ -20,7 +20,7 @@ from openloop.sessions import (
 from openloop.tools import ToolGateway
 from openloop.tools.github import GitHubConnector
 from openloop.usage import InMemoryUsageStore
-from openloop.workflows import InMemoryWorkflowStore, WorkflowEngine
+from openloop.workflows import InMemoryWorkflowStore, WorkflowEngine, WorkflowInstance
 from openloop.testing import (
     EXAMPLE_AGENT,
     FakeGitHub,
@@ -254,6 +254,115 @@ async def test_failed_outcome_delivery_is_repaired_on_second_click():
     assert repaired.final_message_id is not None
     assert len(delivery.finals) == 1
     assert delivery.finals[0]["text"] == repaired.result_summary
+
+
+# --- runner: startup reconciler (Slice 6) --------------------------------
+
+async def test_reconcile_redelivers_terminal_without_final():
+    runner, sessions, delivery = _runner(ScriptedGateway([]))
+    await sessions.upsert(SurfaceSession(
+        id="s1", target=_target("ev1"), status="completed",
+        workflow_instance_id="s1", progress_message_id="p0",
+        result_summary="the answer",
+    ))
+
+    repaired = await runner.reconcile()
+
+    assert repaired == ["s1"]
+    assert len(delivery.finals) == 1
+    assert delivery.finals[0]["text"] == "the answer"
+    assert (await sessions.get("s1")).final_message_id is not None
+
+
+async def test_reconcile_recovers_crashed_turn_from_completed_workflow():
+    runner, sessions, delivery = _runner(ScriptedGateway([]))
+    # The workflow finished but the session crashed before delivering it.
+    await runner.runtime.engine.store.upsert(WorkflowInstance(
+        id="s2", workflow=runner.runtime.workflow_name, status="completed",
+        state={
+            "final_text": "recovered answer",
+            "accounted": {"model": "m", "prompt_tokens": 0,
+                          "completion_tokens": 0, "cost_usd": 0.0},
+            "approval_ids": [],
+        },
+    ))
+    await sessions.upsert(SurfaceSession(
+        id="s2", target=_target("ev2"), status="running",
+        workflow_instance_id="s2", progress_message_id="p0",
+    ))
+
+    await runner.reconcile()
+
+    assert delivery.finals[-1]["text"] == "recovered answer"
+    assert (await sessions.get("s2")).status == "completed"
+
+
+async def test_reconcile_posts_interrupted_notice_for_abandoned_turn():
+    runner, sessions, delivery = _runner(ScriptedGateway([]))
+    await runner.runtime.engine.store.upsert(WorkflowInstance(
+        id="s3", workflow=runner.runtime.workflow_name, status="abandoned",
+        state={"task": {}},
+    ))
+    await sessions.upsert(SurfaceSession(
+        id="s3", target=_target("ev3"), status="running",
+        workflow_instance_id="s3", progress_message_id="p0",
+    ))
+
+    await runner.reconcile()
+
+    assert len(delivery.errors) == 1
+    assert (await sessions.get("s3")).status == "abandoned"
+
+
+async def test_reconcile_leaves_non_terminal_workflow_for_later():
+    # The engine's own resume didn't (or couldn't) drive this to terminal — the
+    # reconciler must not deliver a half-finished turn or abandon it; leave it.
+    runner, sessions, delivery = _runner(ScriptedGateway([]))
+    await runner.runtime.engine.store.upsert(WorkflowInstance(
+        id="s5", workflow=runner.runtime.workflow_name, status="running",
+        completed_steps=["prepare"], state={"task": {}},
+    ))
+    await sessions.upsert(SurfaceSession(
+        id="s5", target=_target("ev5"), status="running",
+        workflow_instance_id="s5", progress_message_id="p0",
+    ))
+
+    repaired = await runner.reconcile()
+
+    assert repaired == []  # left untouched
+    assert delivery.finals == [] and delivery.errors == []
+    assert (await sessions.get("s5")).status == "running"
+
+
+async def test_reconcile_with_no_recoverable_workflow_posts_interrupted():
+    runner, sessions, delivery = _runner(ScriptedGateway([]))
+    # A session whose workflow instance was lost (e.g. in-memory engine restart).
+    await sessions.upsert(SurfaceSession(
+        id="s4", target=_target("ev4"), status="running",
+        workflow_instance_id="missing",
+    ))
+
+    await runner.reconcile()
+
+    assert len(delivery.errors) == 1
+    assert (await sessions.get("s4")).status == "abandoned"
+
+
+async def test_reconcile_leaves_waiting_and_delivered_sessions_alone():
+    runner, sessions, delivery = _runner(ScriptedGateway([]))
+    await sessions.upsert(SurfaceSession(
+        id="w", target=_target("evw"), status="waiting",
+        workflow_instance_id="w", approval_ids=["a1"],
+    ))
+    await sessions.upsert(SurfaceSession(
+        id="d", target=_target("evd"), status="completed",
+        workflow_instance_id="d", final_message_id="final-0",
+    ))
+
+    repaired = await runner.reconcile()
+
+    assert repaired == []
+    assert delivery.finals == [] and delivery.errors == []
 
 
 # --- runner: crash-before-delivery repaired on retry ---------------------

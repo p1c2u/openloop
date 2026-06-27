@@ -279,15 +279,41 @@ class Runtime:
             s["usage_recorded"] = True
             self._log_completion(task, accounted, outcome)
 
+    async def recover_response(
+        self, instance_id: str
+    ) -> tuple[bool, "ModelResponse | None"]:
+        """For the Phase D session reconciler: recover a crashed turn's response
+        from its persisted workflow, **without** re-running it.
+
+        Returns ``(found, response)``:
+
+        - ``(False, None)`` — no engine, or the instance is gone: unrecoverable,
+          so the reconciler should post an interrupted notice.
+        - ``(True, None)`` — the instance exists but is **not terminal** (still
+          running/waiting, e.g. the engine's own resume hasn't finished or failed):
+          leave it for a later restart rather than delivering a half-finished turn.
+        - ``(True, response)`` — terminal: the answer (``completed``) or an
+          interrupted notice (``failed`` / ``cancelled`` / ``abandoned``).
+        """
+        from openloop.workflows.store import TERMINAL as WF_TERMINAL
+
+        if self.engine is None:
+            return False, None
+        instance = await self.engine.store.get(instance_id)
+        if instance is None:
+            return False, None
+        if instance.status not in WF_TERMINAL:
+            return True, None
+        if instance.status in ("failed", "cancelled", "abandoned"):
+            return True, _interrupted_response()
+        return True, self._response_from(instance)
+
     def _response_from(self, instance) -> ModelResponse:
         s = instance.state
         if s.get("blocked"):
             return _blocked_response(s["block_reason"])
         if instance.status in ("failed", "abandoned"):
-            return ModelResponse(
-                text="⚠️ This task was interrupted and could not be completed.",
-                model="error",
-            )
+            return _interrupted_response()
         accounted = _resp_from_dict(s.get("accounted", {}))
         return _final_response(
             s.get("final_text", ""), accounted, s.get("approval_ids", []),
@@ -411,6 +437,13 @@ class Runtime:
 def _blocked_response(reason: str) -> ModelResponse:
     return ModelResponse(
         text=f"💸 Budget guard: {reason}. Action blocked.", model="budget-guard"
+    )
+
+
+def _interrupted_response() -> ModelResponse:
+    return ModelResponse(
+        text="⚠️ This task was interrupted and could not be completed.",
+        model="error",
     )
 
 
