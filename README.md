@@ -101,21 +101,49 @@ rows below are common ground; the rest are where OpenLoop goes further.
 
 ## How it works
 
-```
-Slack / Discord / Zoom / GitHub / Linear     (surfaces)
-            │
-            ▼
-   ┌──────────────────┐   model policy   ┌──────────────┐
-   │   Agent runtime  │ ───────────────▶ │ Model gateway│ ─▶ OpenAI / Anthropic
-   │                  │                  │  (LiteLLM)   │    Gemini / Ollama / ...
-   └───────┬──────────┘                  └──────────────┘
-           │ tool policy        memory · budget · audit
-           ▼                    ┌──────────────────────┐
-   ┌──────────────┐             │  Postgres (pgvector) │
-   │ Tool gateway │ ──▶ GitHub  └──────────────────────┘
-   │    (MCP)     │     CI / coding worker / ...
-   └──────────────┘
-                      write actions ─▶ human approval
+```mermaid
+flowchart TB
+    subgraph SURFACES["🗣️ &nbsp;Surfaces &nbsp;<sub>(shared team channels)</sub>"]
+        direction LR
+        S1[Slack] ~~~ S2[Discord] ~~~ S3[Zoom] ~~~ S4[GitHub] ~~~ S5[Linear]
+    end
+
+    subgraph SELF["🏠 &nbsp;Self-hosted — your infra, your keys, inspectable"]
+        RT["⚙️ &nbsp;Agent Runtime<br/><sub>shared team agent · loads policy · budget</sub>"]
+        MG["🧠 &nbsp;Model Gateway<br/><sub>LiteLLM · model-agnostic</sub>"]
+        TG["🔧 &nbsp;Tool Gateway<br/><sub>MCP + native · allowlist</sub>"]
+        DB[("🗄️ &nbsp;Postgres + pgvector<br/><sub>channel-scoped memory · budget · audit</sub>")]
+        HA{{"✋ &nbsp;Human approval"}}
+    end
+
+    subgraph MODELS["☁️ &nbsp;Model providers <sub>(external)</sub>"]
+        direction LR
+        M1[OpenAI] ~~~ M2[Anthropic] ~~~ M3[Gemini] ~~~ M4[Ollama] ~~~ M5[OpenRouter]
+    end
+
+    subgraph TOOLS["🛠️ &nbsp;Tool targets <sub>(external)</sub>"]
+        direction LR
+        T1[GitHub] ~~~ T2[CI] ~~~ T3[Coding worker]
+    end
+
+    SURFACES -- "mention / event" --> RT
+    RT -- "model policy" --> MG
+    RT -- "tool policy" --> TG
+    RT <-. "read / write" .-> DB
+    MG -- "your provider keys" --> MODELS
+    TG -- "reads" --> TOOLS
+    TG -- "write actions" --> HA
+    HA -- "approved" --> TOOLS
+
+    classDef runtime fill:#7c3aed,stroke:#5b21b6,color:#fff,font-weight:bold
+    classDef gateway fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
+    classDef store fill:#0ea5e9,stroke:#0369a1,color:#fff
+    classDef gate fill:#f59e0b,stroke:#b45309,color:#1f2937,font-weight:bold
+    class RT runtime
+    class MG,TG gateway
+    class DB store
+    class HA gate
+    style SELF fill:#faf5ff,stroke:#7c3aed,stroke-width:2px,stroke-dasharray:7 4
 ```
 
 A mention or event on any surface triggers the team's agent. The runtime loads
