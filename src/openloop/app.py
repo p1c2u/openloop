@@ -9,6 +9,8 @@ health check. Run with:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import dataclasses
 import logging
 from contextlib import asynccontextmanager
@@ -23,6 +25,7 @@ from openloop.approvals.postgres import PostgresApprovalStore
 from openloop.checkpoints import CheckpointStore, InMemoryCheckpointStore
 from openloop.checkpoints.postgres import PostgresCheckpointStore
 from openloop.config import Settings, get_settings
+from openloop.coordination import DistributedLock, InProcessLock, RedisLock, guard
 from openloop.memory import Embedder, InMemoryStore, LiteLLMEmbedder, MemoryStore
 from openloop.memory.postgres import PostgresMemoryStore
 from openloop.runtime import Runtime
@@ -103,6 +106,24 @@ def build_surface_session_store(settings: Settings) -> SurfaceSessionStore:
     if settings.memory_backend == "postgres":
         return PostgresSurfaceSessionStore(settings.database_url)
     return InMemorySurfaceSessionStore()
+
+
+def build_lock(settings: Settings) -> DistributedLock:
+    """Pick a coordination backend. Redis connectivity is checked at startup.
+
+    Defaults to a process-local lock (correct for a single replica). ``redis``
+    enables cross-process leadership; if the ``redis`` package is missing it
+    degrades to in-process here, and a connectivity failure degrades at startup.
+    """
+    if settings.lock_backend == "redis":
+        try:
+            return RedisLock.from_url(settings.redis_url)
+        except Exception:
+            log.exception(
+                "redis lock unavailable (is the `redis` extra installed?) — "
+                "falling back to in-process coordination"
+            )
+    return InProcessLock()
 
 
 def build_tool_gateway(
@@ -193,6 +214,9 @@ def create_app() -> FastAPI:
     workflows = build_workflow_store(settings)
     engine = WorkflowEngine(workflows)
     sessions = build_surface_session_store(settings)
+    # Cross-process lock: lets one replica lead startup recovery. Rebound to an
+    # in-process lock in the lifespan if a configured Redis can't be reached.
+    coordinator = build_lock(settings)
     # The Slack SessionRunner captures the session store by reference; the lifespan
     # needs a handle to it to repoint after a Postgres fallback. Set in the Slack
     # block below (stays None when no Slack surface is bound).
@@ -203,6 +227,8 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        nonlocal coordinator
+        recovery_task: asyncio.Task | None = None
         if isinstance(store, PostgresMemoryStore):
             try:
                 await store.setup()
@@ -288,28 +314,34 @@ def create_app() -> FastAPI:
         else:
             log.info("surface-session backend: in-memory (process-local)")
 
-        # Resume work left incomplete by a crash. The workflow engine re-drives
-        # any instance left "running"; the connector reconciler covers the Phase B
-        # (no-engine) checkpoint path. resolve() won't re-invoke an approved
-        # request, so these reconcilers are what actually trigger resume.
-        if tools.engine is not None:
+        if isinstance(coordinator, RedisLock):
             try:
-                resumed = await tools.engine.resume_incomplete()
-                if resumed:
-                    log.info("resumed %d incomplete workflow(s)", len(resumed))
+                await coordinator.setup()
+                log.info("coordination backend: redis")
             except Exception:
-                log.exception("workflow resume failed")
-        await _resume_worker_jobs(tools)
+                log.exception(
+                    "redis ping failed — falling back to in-process coordination"
+                )
+                await _safe_close(coordinator)
+                coordinator = InProcessLock()
+        else:
+            log.info("coordination backend: in-process (single-replica)")
+        app.state.coordinator = coordinator  # the resolved lock (post-fallback)
 
-        # Repair surface-session delivery left mid-flight by a crash — runs after
-        # the engine resume above so each session's workflow is already terminal.
-        if session_runner is not None:
-            try:
-                repaired = await session_runner.reconcile()
-                if repaired:
-                    log.info("reconciled %d surface session(s)", len(repaired))
-            except Exception:
-                log.exception("surface-session reconcile failed")
+        # Recover work left incomplete by a crash, as the recovery *leader* so that
+        # when several replicas boot together only one runs the (idempotent but
+        # wasteful-to-duplicate) sweeps. Run once now (before serving), then keep
+        # re-running on an interval: a leader that crashes mid-sweep — whose Redis
+        # lock then lingers for its whole TTL, even past its own restart — is
+        # covered when a surviving replica's next pass acquires the lapsed lock.
+        # Without the periodic retry a one-shot skip would strand that work until
+        # an unrelated restart.
+        await run_recovery_pass(coordinator, tools, session_runner)
+        interval = settings.recovery_interval_seconds
+        if interval > 0:
+            recovery_task = asyncio.create_task(
+                _recovery_loop(coordinator, tools, session_runner, interval=interval)
+            )
 
         for connector in getattr(tools, "mcp_connectors", []):
             try:
@@ -322,6 +354,10 @@ def create_app() -> FastAPI:
 
         yield
 
+        if recovery_task is not None:
+            recovery_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await recovery_task
         if isinstance(store, PostgresMemoryStore):
             await store.close()
         if isinstance(usage, PostgresUsageStore):
@@ -334,6 +370,8 @@ def create_app() -> FastAPI:
             await workflows.close()
         if isinstance(sessions, PostgresSurfaceSessionStore):
             await sessions.close()
+        if isinstance(coordinator, RedisLock):
+            await _safe_close(coordinator)
 
     app = FastAPI(title="OpenLoop", version="0.0.1", lifespan=lifespan)
     app.state.settings = settings
@@ -342,6 +380,8 @@ def create_app() -> FastAPI:
     app.state.usage = usage
     app.state.tools = tools
     app.state.sessions = sessions
+    # app.state.coordinator is set in the lifespan, after Redis connectivity is
+    # checked, so it reflects the resolved lock (post any fallback).
     app.state.primary_agent = primary_agent
 
     # Bind the first Slack-enabled agent. The Bolt app is built when a bot
@@ -496,6 +536,86 @@ def _disable_checkpoints(tools: ToolGateway) -> None:
     worker = tools._tools.get("coding_worker")
     if worker is not None:
         worker.checkpoints = InMemoryCheckpointStore()
+
+
+# Lease for the recovery lock. Short on purpose — a crashed leader's lock frees
+# within this window — but renewed every _RECOVERY_LOCK_RENEW_SECONDS while a pass
+# runs, so a live leader keeps the lock no matter how long the sweep takes (the
+# worker resume can re-drive model generation + git push + PR open, well past the
+# raw TTL). This decouples "self-heal latency" from "max sweep duration", so two
+# replicas can't both acquire and re-drive the same jobs concurrently.
+_RECOVERY_LOCK_TTL_SECONDS = 60.0
+_RECOVERY_LOCK_RENEW_SECONDS = 20.0
+
+
+async def run_recovery_pass(coordinator, tools: ToolGateway, session_runner) -> bool:
+    """Guarded sweep of the crash-recovery reconcilers; returns whether we led it.
+
+    Acquires the shared ``startup-recovery`` lock so that across replicas only one
+    sweeps at a time; a contended replica returns ``False`` without doing the work
+    (the leader's shared-store reconcile covers it). Idempotent and safe to repeat,
+    which is what lets the periodic loop heal a leader that crashed mid-sweep once
+    its lock TTL lapses. The lock is coordination, not correctness — a TTL expiry
+    or in-process fallback at worst re-does idempotent work.
+    """
+    async with guard(
+        coordinator,
+        "startup-recovery",
+        ttl_seconds=_RECOVERY_LOCK_TTL_SECONDS,
+        renew_interval=_RECOVERY_LOCK_RENEW_SECONDS,
+    ) as is_leader:
+        if not is_leader:
+            log.debug("another replica is leading recovery — skipping this pass")
+            return False
+        # The workflow engine re-drives any instance left "running"; the connector
+        # reconciler covers the Phase B (no-engine) checkpoint path. resolve() won't
+        # re-invoke an approved request, so these reconcilers trigger the resume.
+        engine = getattr(tools, "engine", None)
+        if engine is not None:
+            try:
+                resumed = await engine.resume_incomplete()
+                if resumed:
+                    log.info("resumed %d incomplete workflow(s)", len(resumed))
+            except Exception:
+                log.exception("workflow resume failed")
+        await _resume_worker_jobs(tools)
+
+        # Repair surface-session delivery left mid-flight by a crash — after the
+        # engine resume above so each session's workflow is already terminal.
+        if session_runner is not None:
+            try:
+                repaired = await session_runner.reconcile()
+                if repaired:
+                    log.info("reconciled %d surface session(s)", len(repaired))
+            except Exception:
+                log.exception("surface-session reconcile failed")
+        return True
+
+
+async def _recovery_loop(
+    coordinator, tools: ToolGateway, session_runner, *, interval: float
+) -> None:
+    """Re-run :func:`run_recovery_pass` every ``interval`` seconds until cancelled.
+
+    The self-healing backstop for a leader that died mid-sweep: a surviving
+    replica's next pass acquires the lapsed lock and finishes the recovery.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await run_recovery_pass(coordinator, tools, session_runner)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("periodic recovery pass failed")
+
+
+async def _safe_close(closeable) -> None:
+    """Best-effort close of a coordination client; never raise from teardown."""
+    try:
+        await closeable.close()
+    except Exception:
+        log.warning("failed to close coordination client", exc_info=True)
 
 
 async def _resume_worker_jobs(tools: ToolGateway) -> None:

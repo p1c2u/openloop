@@ -348,10 +348,11 @@ class CodingWorkerConnector:
         (checkpoints + force-push + ``find_pull``), so finishing or restarting each
         job is safe.
 
-        Single-runtime assumption: there is no cross-process lock, so do not run
-        this where another process may be executing the same job. Phase C folds
-        this into the workflow engine, where approval is an event and ``resolve``
-        is a thin adapter.
+        Across replicas, the app lifespan runs this under a ``startup-recovery``
+        :class:`~openloop.coordination.DistributedLock` so only the leader resumes
+        jobs; ``execute`` itself stays idempotent if two ever overlap. Phase C
+        folds this into the workflow engine, where approval is an event and
+        ``resolve`` is a thin adapter.
         """
         if self.checkpoints is None:
             return []

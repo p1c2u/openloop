@@ -14,7 +14,10 @@ RUN apt-get update \
 COPY pyproject.toml README.md ./
 COPY src ./src
 
-RUN pip install --upgrade pip && pip install .
+# Install with the `redis` extra so the documented multi-replica deploy path
+# (LOCK_BACKEND=redis) can actually coordinate — without it the runtime silently
+# falls back to in-process locks.
+RUN pip install --upgrade pip && pip install ".[redis]"
 
 COPY agents ./agents
 

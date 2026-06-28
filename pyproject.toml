@@ -29,6 +29,9 @@ dev = [
 mcp = [
     "mcp>=1.0",
 ]
+redis = [
+    "redis>=5.0",
+]
 
 [project.scripts]
 openloop = "openloop.cli:main"

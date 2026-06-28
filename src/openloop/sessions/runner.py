@@ -207,7 +207,10 @@ class SessionRunner:
           delivered) → recover the answer from the now-terminal workflow instance
           and deliver it, or post an interrupted notice if it can't be recovered.
 
-        Single-runtime assumption — no cross-process lock yet (Redis later).
+        Idempotent, so safe to run on every boot. Across replicas, the app lifespan
+        runs it under a ``startup-recovery`` :class:`~openloop.coordination.\
+        DistributedLock` so only the leader sweeps; delivery stays id-/key-guarded
+        if two ever overlap.
         """
         repaired: list[str] = []
         for session in await self.sessions.recent(limit=1000):

@@ -135,8 +135,9 @@ class WorkflowEngine:
         """Re-drive instances left ``running`` by a crash. Call once at startup.
 
         ``waiting`` instances stay parked (their event hasn't arrived);
-        ``completed`` / ``failed`` are terminal. Single-runtime assumption — no
-        cross-process lock yet.
+        ``completed`` / ``failed`` are terminal. Idempotent; across replicas the
+        app lifespan runs it under a ``startup-recovery``
+        :class:`~openloop.coordination.DistributedLock` so only the leader sweeps.
         """
         resumed: list[str] = []
         for instance in await self.store.recent(limit=1000):
