@@ -16,6 +16,12 @@ implementations, chosen like the other backends:
 * :class:`RedisLock` — a real cross-process lock (Redis ``SET NX PX`` with a
   fenced, compare-and-delete release) for running more than one replica.
 
+* :class:`PostgresLock` — a cross-process lock over Postgres *session-level
+  advisory locks*. Reuses the deployment's existing Postgres (no extra service),
+  and the lease is the connection itself: a crashed holder's connection drops and
+  Postgres frees the lock immediately, so there is no TTL to tune and no renewal
+  to run.
+
 The lock is a *coordination* layer, not a correctness one: a TTL expiry or a
 fallback to :class:`InProcessLock` at worst lets a second replica redo idempotent
 work — it never corrupts state.
@@ -25,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import uuid
 from contextlib import asynccontextmanager
@@ -216,3 +223,83 @@ class RedisLock:
         closer = getattr(self.client, "aclose", None) or getattr(self.client, "close", None)
         if closer is not None:
             await closer()
+
+
+class PostgresLock:
+    """Cross-process lock over Postgres session-level advisory locks.
+
+    Reuses the deployment's existing Postgres — no extra service to run. Each held
+    key keeps one dedicated pooled connection checked out; ``pg_try_advisory_lock``
+    binds the lock to that *session*, so the **connection is the lease**: if the
+    holder crashes, its connection drops and Postgres releases the lock at once —
+    no TTL to tune (``ttl_seconds`` is ignored) and no renewal (``renew`` is a
+    no-op that just confirms we still hold it). The pool is small and separate from
+    the stores' pools so a long-held lock never starves query traffic.
+    """
+
+    def __init__(self, dsn: str, *, max_size: int = 2) -> None:
+        self.dsn = dsn
+        self._max_size = max_size
+        self._pool = None  # asyncpg.Pool, created in setup()
+        self._held: dict[str, object] = {}  # token -> checked-out Connection
+
+    async def setup(self) -> None:
+        import asyncpg  # noqa: PLC0415 — optional until a Postgres deploy needs it
+
+        # min_size=0 so an idle single-replica process holds no lock connections.
+        self._pool = await asyncpg.create_pool(
+            self.dsn, min_size=0, max_size=self._max_size
+        )
+
+    @staticmethod
+    def _lock_id(key: str) -> int:
+        """Map a string key to the signed 64-bit int ``pg_advisory_lock`` takes."""
+        digest = hashlib.blake2b(key.encode(), digest_size=8).digest()
+        return int.from_bytes(digest, "big", signed=True)
+
+    def _require_pool(self):
+        if self._pool is None:
+            raise RuntimeError("PostgresLock.setup() must be called first")
+        return self._pool
+
+    async def acquire(self, key: str, *, ttl_seconds: float) -> str | None:
+        pool = self._require_pool()
+        conn = await pool.acquire()
+        try:
+            got = await conn.fetchval("SELECT pg_try_advisory_lock($1)", self._lock_id(key))
+        except BaseException:
+            await pool.release(conn)
+            raise
+        if not got:
+            await pool.release(conn)
+            return None
+        token = uuid.uuid4().hex
+        self._held[token] = conn  # hold the connection → hold the lease
+        return token
+
+    async def release(self, key: str, token: str) -> bool:
+        conn = self._held.pop(token, None)
+        if conn is None:
+            return False
+        pool = self._require_pool()
+        try:
+            await conn.execute("SELECT pg_advisory_unlock($1)", self._lock_id(key))
+        finally:
+            await pool.release(conn)
+        return True
+
+    async def renew(self, key: str, token: str, *, ttl_seconds: float) -> bool:
+        # The held session is the lease — there is nothing to extend.
+        return token in self._held
+
+    async def close(self) -> None:
+        if self._pool is None:
+            return
+        # Return any still-held connections (closing the pool ends their sessions,
+        # which also drops the advisory locks).
+        for conn in list(self._held.values()):
+            with contextlib.suppress(Exception):
+                await self._pool.release(conn)
+        self._held.clear()
+        await self._pool.close()
+        self._pool = None

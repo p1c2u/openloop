@@ -2,13 +2,14 @@
 
 import asyncio
 import contextlib
+import logging
 
 import pytest
 from fastapi.testclient import TestClient
 
 from openloop import app as appmod
 from openloop.config import Settings
-from openloop.coordination import InProcessLock, RedisLock
+from openloop.coordination import InProcessLock, PostgresLock, RedisLock
 
 pytestmark = pytest.mark.integration
 
@@ -37,8 +38,50 @@ class _SpyRunner:
         return []
 
 
-def test_build_lock_defaults_to_in_process():
-    assert isinstance(appmod.build_lock(Settings(lock_backend="memory")), InProcessLock)
+def test_build_lock_auto_follows_memory_backend():
+    # auto + in-memory stores → process-local; auto + postgres → advisory lock
+    # (reuses the DB the deploy already runs, no extra service).
+    auto_mem = appmod.build_lock(Settings(lock_backend="auto", memory_backend="memory"))
+    auto_pg = appmod.build_lock(Settings(lock_backend="auto", memory_backend="postgres"))
+    assert isinstance(auto_mem, InProcessLock)
+    assert isinstance(auto_pg, PostgresLock)
+
+
+def test_build_lock_explicit_overrides_memory_backend():
+    forced_mem = appmod.build_lock(
+        Settings(lock_backend="memory", memory_backend="postgres")
+    )
+    forced_pg = appmod.build_lock(
+        Settings(lock_backend="postgres", memory_backend="memory")
+    )
+    assert isinstance(forced_mem, InProcessLock)
+    assert isinstance(forced_pg, PostgresLock)
+
+
+class _FailingSetupLock:
+    async def setup(self):
+        raise RuntimeError("coordination backend down")
+
+    async def close(self):
+        pass
+
+
+async def test_explicit_backend_setup_failure_logs_loudly(caplog):
+    # An operator who asked for cross-process coordination must SEE it was disabled.
+    lock = _FailingSetupLock()
+    with caplog.at_level(logging.ERROR):
+        resolved = await appmod._setup_coordination(lock, Settings(lock_backend="redis"))
+    assert isinstance(resolved, InProcessLock)
+    assert "CROSS-PROCESS COORDINATION DISABLED" in caplog.text
+
+
+async def test_auto_backend_setup_failure_degrades_quietly(caplog):
+    # auto wasn't an explicit coordination request → quiet degrade, no loud banner.
+    lock = _FailingSetupLock()
+    with caplog.at_level(logging.ERROR):
+        resolved = await appmod._setup_coordination(lock, Settings(lock_backend="auto"))
+    assert isinstance(resolved, InProcessLock)
+    assert "CROSS-PROCESS COORDINATION DISABLED" not in caplog.text
 
 
 def test_build_lock_redis_missing_package_falls_back(monkeypatch):

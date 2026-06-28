@@ -358,10 +358,11 @@ the workflow.
   recording its id is recovered by key instead of re-posting; best-effort, falls
   back to at-least-once if the surface lookup can't run), and delivery outside the
   original request lifecycle
-- [x] Cross-process coordination — a distributed lock (`LOCK_BACKEND=redis`) so
-  that when several replicas boot together only one leads recovery, re-run on an
-  interval so a leader that dies mid-sweep is healed by a survivor; degrades to a
-  process-local lock for a single replica
+- [x] Cross-process coordination — a distributed lock so that when several
+  replicas boot together only one leads recovery, re-run on an interval so a
+  leader that dies mid-sweep is healed by a survivor. `LOCK_BACKEND=auto` (default)
+  uses Postgres advisory locks when the deploy already runs Postgres — no extra
+  service — with Redis and process-local backends also available
 - [ ] Hardening for full production parity — more surface adapters and an explicit
   model-call replay/caching policy
 - [ ] Next.js dashboard, OTel/Langfuse tracing

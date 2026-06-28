@@ -9,6 +9,8 @@ falls back to the docker-compose default. Skips cleanly otherwise so the normal
 suite stays green without Docker.
 """
 
+import asyncio
+import contextlib
 import os
 import uuid
 from dataclasses import replace
@@ -410,6 +412,69 @@ async def test_thread_history_across_real_postgres():
         except Exception:
             pass
         await store.close()
+
+
+async def test_postgres_advisory_lock_mutual_exclusion():
+    """Two PostgresLock instances (≈ two replicas) can't both hold one key."""
+    if not await _reachable():
+        pytest.skip(f"no Postgres reachable at {DSN}")
+
+    from openloop.coordination import PostgresLock
+
+    key = f"lock-{uuid.uuid4().hex[:8]}"
+    a, b = PostgresLock(DSN), PostgresLock(DSN)
+    await a.setup()
+    await b.setup()
+    try:
+        token = await a.acquire(key, ttl_seconds=60)
+        assert token is not None
+        # A separate instance (its own session) is refused while a holds it.
+        assert await b.acquire(key, ttl_seconds=60) is None
+        # renew is a no-op that confirms ownership (the session is the lease).
+        assert await a.renew(key, token, ttl_seconds=60) is True
+        # Explicit release frees it for the other replica.
+        assert await a.release(key, token) is True
+        other = await b.acquire(key, ttl_seconds=60)
+        assert other is not None
+        await b.release(key, other)
+    finally:
+        await a.close()
+        await b.close()
+
+
+async def test_postgres_advisory_lock_frees_when_holder_goes_away():
+    """A holder whose pool closes (a graceful stand-in for a crashed replica)
+    releases its session, so its advisory lock frees and another replica acquires —
+    no TTL to wait out. This is the property that makes advisory locks a good fit."""
+    if not await _reachable():
+        pytest.skip(f"no Postgres reachable at {DSN}")
+
+    from openloop.coordination import PostgresLock
+
+    key = f"lock-{uuid.uuid4().hex[:8]}"
+    a, b = PostgresLock(DSN), PostgresLock(DSN)
+    await a.setup()
+    await b.setup()
+    try:
+        token = await a.acquire(key, ttl_seconds=60)
+        assert token is not None
+        assert await b.acquire(key, ttl_seconds=60) is None
+
+        # The holder "crashes": closing its pool ends the session holding the lock.
+        await a.close()
+
+        acquired = None
+        for _ in range(40):  # allow a brief moment for the session to drop
+            acquired = await b.acquire(key, ttl_seconds=60)
+            if acquired is not None:
+                break
+            await asyncio.sleep(0.05)
+        assert acquired is not None
+        await b.release(key, acquired)
+    finally:
+        await b.close()
+        with contextlib.suppress(Exception):
+            await a.close()
 
 
 async def test_session_reconcile_across_real_postgres():

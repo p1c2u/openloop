@@ -44,11 +44,16 @@ class Settings(BaseSettings):
     )
     redis_url: str = "redis://localhost:6379/0"
 
-    # Cross-process coordination for multi-replica deploys. "memory" (process-local
-    # lock, default — correct for a single replica) or "redis" (shared lock so
-    # exactly one replica leads startup recovery). Needs `redis_url` + the `redis`
-    # extra; falls back to in-process if Redis is unreachable.
-    lock_backend: str = "memory"
+    # Cross-process coordination for multi-replica deploys — which lock backend
+    # leads startup recovery:
+    #   "auto"     (default) — follow memory_backend: Postgres advisory lock when
+    #              memory_backend=postgres (no extra service), else in-process.
+    #   "memory"   — force a process-local lock (single replica).
+    #   "postgres" — force Postgres advisory locks (reuses database_url).
+    #   "redis"    — force a Redis lock (needs redis_url + the `redis` extra).
+    # An *explicit* postgres/redis that can't start logs loudly then degrades to
+    # in-process; "auto" degrades quietly.
+    lock_backend: str = "auto"
     # How often (seconds) to re-run the crash-recovery sweep under the lock, the
     # backstop that heals a recovery leader that died mid-sweep. 0 disables the
     # periodic retry (startup-only). Runs once at startup regardless.

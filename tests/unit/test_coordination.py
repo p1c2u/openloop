@@ -9,7 +9,7 @@ import asyncio
 
 import pytest
 
-from openloop.coordination import InProcessLock, RedisLock, guard
+from openloop.coordination import InProcessLock, PostgresLock, RedisLock, guard
 
 pytestmark = pytest.mark.unit
 
@@ -221,3 +221,12 @@ async def test_guard_without_renew_interval_does_not_renew():
         assert leader is True
         await asyncio.sleep(0.01)
     assert lock.renews == 0
+
+
+# --- PostgresLock key hashing (no DB) ------------------------------------
+
+def test_postgres_lock_id_is_deterministic_and_in_bigint_range():
+    a = PostgresLock._lock_id("startup-recovery")
+    assert a == PostgresLock._lock_id("startup-recovery")  # stable across calls
+    assert -(2**63) <= a < 2**63  # fits the signed bigint pg_advisory_lock takes
+    assert PostgresLock._lock_id("other-key") != a

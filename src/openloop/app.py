@@ -25,7 +25,13 @@ from openloop.approvals.postgres import PostgresApprovalStore
 from openloop.checkpoints import CheckpointStore, InMemoryCheckpointStore
 from openloop.checkpoints.postgres import PostgresCheckpointStore
 from openloop.config import Settings, get_settings
-from openloop.coordination import DistributedLock, InProcessLock, RedisLock, guard
+from openloop.coordination import (
+    DistributedLock,
+    InProcessLock,
+    PostgresLock,
+    RedisLock,
+    guard,
+)
 from openloop.memory import Embedder, InMemoryStore, LiteLLMEmbedder, MemoryStore
 from openloop.memory.postgres import PostgresMemoryStore
 from openloop.runtime import Runtime
@@ -108,14 +114,28 @@ def build_surface_session_store(settings: Settings) -> SurfaceSessionStore:
     return InMemorySurfaceSessionStore()
 
 
-def build_lock(settings: Settings) -> DistributedLock:
-    """Pick a coordination backend. Redis connectivity is checked at startup.
+def _resolve_lock_backend(settings: Settings) -> str:
+    """Resolve ``lock_backend``, expanding ``auto`` to follow ``memory_backend``."""
+    backend = settings.lock_backend
+    if backend == "auto":
+        # A Postgres deploy already has the shared dependency advisory locks need,
+        # so a multi-replica Postgres deploy gets coordination without extra infra;
+        # otherwise there's nothing to coordinate against → process-local.
+        return "postgres" if settings.memory_backend == "postgres" else "memory"
+    return backend
 
-    Defaults to a process-local lock (correct for a single replica). ``redis``
-    enables cross-process leadership; if the ``redis`` package is missing it
-    degrades to in-process here, and a connectivity failure degrades at startup.
+
+def build_lock(settings: Settings) -> DistributedLock:
+    """Pick a coordination backend; its store/connection is set up at startup.
+
+    ``auto`` (default) follows ``memory_backend``. ``postgres`` reuses the existing
+    database; ``redis`` needs the optional ``redis`` extra (a missing package
+    degrades to in-process here, a connectivity failure degrades at startup).
     """
-    if settings.lock_backend == "redis":
+    backend = _resolve_lock_backend(settings)
+    if backend == "postgres":
+        return PostgresLock(settings.database_url)
+    if backend == "redis":
         try:
             return RedisLock.from_url(settings.redis_url)
         except Exception:
@@ -124,6 +144,47 @@ def build_lock(settings: Settings) -> DistributedLock:
                 "falling back to in-process coordination"
             )
     return InProcessLock()
+
+
+_COORD_LABEL = {RedisLock: "redis", PostgresLock: "postgres"}
+
+
+async def _setup_coordination(
+    coordinator: DistributedLock, settings: Settings
+) -> DistributedLock:
+    """Set up the coordination backend, degrading to in-process on failure.
+
+    A backend the operator *explicitly* asked for (``lock_backend`` postgres/redis)
+    is a deliberate request for cross-process coordination, so a setup failure is
+    logged loudly — silently running process-local locks across replicas is the
+    footgun this feature exists to remove. An ``auto``-selected backend degrades
+    quietly (consistent with the other stores' "degrade, don't fail boot" posture).
+    """
+    setup = getattr(coordinator, "setup", None)
+    if setup is None:  # InProcessLock — nothing to start
+        log.info("coordination backend: in-process (single-replica)")
+        return coordinator
+    try:
+        await setup()
+        log.info(
+            "coordination backend: %s",
+            _COORD_LABEL.get(type(coordinator), type(coordinator).__name__),
+        )
+        return coordinator
+    except Exception:
+        if settings.lock_backend in ("postgres", "redis"):
+            log.error(
+                "CROSS-PROCESS COORDINATION DISABLED: LOCK_BACKEND=%s could not "
+                "start; multiple replicas may run recovery concurrently. Falling "
+                "back to a process-local lock.",
+                settings.lock_backend, exc_info=True,
+            )
+        else:
+            log.exception(
+                "coordination backend setup failed — falling back to in-process"
+            )
+        await _safe_close(coordinator)
+        return InProcessLock()
 
 
 def build_tool_gateway(
@@ -314,18 +375,7 @@ def create_app() -> FastAPI:
         else:
             log.info("surface-session backend: in-memory (process-local)")
 
-        if isinstance(coordinator, RedisLock):
-            try:
-                await coordinator.setup()
-                log.info("coordination backend: redis")
-            except Exception:
-                log.exception(
-                    "redis ping failed — falling back to in-process coordination"
-                )
-                await _safe_close(coordinator)
-                coordinator = InProcessLock()
-        else:
-            log.info("coordination backend: in-process (single-replica)")
+        coordinator = await _setup_coordination(coordinator, settings)
         app.state.coordinator = coordinator  # the resolved lock (post-fallback)
 
         # Recover work left incomplete by a crash, as the recovery *leader* so that
@@ -370,7 +420,7 @@ def create_app() -> FastAPI:
             await workflows.close()
         if isinstance(sessions, PostgresSurfaceSessionStore):
             await sessions.close()
-        if isinstance(coordinator, RedisLock):
+        if hasattr(coordinator, "close"):  # RedisLock / PostgresLock (not in-process)
             await _safe_close(coordinator)
 
     app = FastAPI(title="OpenLoop", version="0.0.1", lifespan=lifespan)

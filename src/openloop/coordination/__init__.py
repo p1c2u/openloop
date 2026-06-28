@@ -3,6 +3,7 @@
 from openloop.coordination.lock import (
     DistributedLock,
     InProcessLock,
+    PostgresLock,
     RedisLock,
     guard,
 )
@@ -10,6 +11,7 @@ from openloop.coordination.lock import (
 __all__ = [
     "DistributedLock",
     "InProcessLock",
+    "PostgresLock",
     "RedisLock",
     "guard",
 ]
