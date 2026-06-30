@@ -247,16 +247,33 @@ mise run apply -- -f agents/dev-platform.yaml   # validate an agent config
 #### Try it against real Slack (Socket Mode)
 
 Socket Mode opens an outbound WebSocket, so you can test a real mention →
-reply → approval round-trip locally — no public URL or tunnel. In your `.env`
-set a model key, `SLACK_BOT_TOKEN` (`xoxb-…`), and `SLACK_APP_TOKEN` (`xapp-…`,
-created with the `connections:write` scope and Socket Mode enabled), then:
+reply → approval round-trip locally — no public URL or tunnel. Set up a Slack app
+once, then run the socket:
+
+1. **Enable Socket Mode** and generate an app-level token with the
+   `connections:write` scope → this is your `SLACK_APP_TOKEN` (`xapp-…`).
+2. **Add bot OAuth scopes** (OAuth & Permissions → Bot Token Scopes):
+   `chat:write`, `app_mentions:read`, and `channels:history`. For private
+   channels and DMs, also add `groups:history`, `im:history`, `mpim:history`.
+3. **Subscribe to bot events** (Event Subscriptions → Subscribe to bot events) —
+   Slack only delivers events you subscribe to:
+   - `app_mention` — direct `@bot` mentions.
+   - `message.channels` — lets the bot follow up on replies in a thread
+     it already owns *without* being re-mentioned.
+   - `message.groups` / `message.im` / `message.mpim` — the same for private
+     channels and DMs.
+4. **Install the app** to your workspace, copy the bot token → `SLACK_BOT_TOKEN`
+   (`xoxb-…`), and invite the bot to a channel.
+5. **Set `.env`**: a model key, `SLACK_BOT_TOKEN`, and `SLACK_APP_TOKEN`. Then run:
 
 ```bash
 mise exec -- openloop slack socket   # connects; mention the bot in a channel
 ```
 
-Read-only observability while it runs: `GET /usage` (spend vs. budget) and
-`GET /audit` (recent token/cost records).
+Mention the bot to start a thread; you can
+keep replying in that thread without re-tagging it. Read-only observability while
+it runs: `GET /usage` (spend vs. budget) and `GET /audit` (recent token/cost
+records).
 
 #### End-to-end tests
 
