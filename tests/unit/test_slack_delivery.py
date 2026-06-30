@@ -41,12 +41,17 @@ class FakeSlackClient:
         return {"ts": ts}
 
     async def assistant_threads_setStatus(
-        self, *, channel_id, thread_ts, status, **kwargs
+        self, *, channel_id, thread_ts, status, loading_messages=None, **kwargs
     ):
         if self.lookup_error:
             raise RuntimeError("missing assistant scope")
         self.statuses.append(
-            {"channel_id": channel_id, "thread_ts": thread_ts, "status": status}
+            {
+                "channel_id": channel_id,
+                "thread_ts": thread_ts,
+                "status": status,
+                "loading_messages": loading_messages,
+            }
         )
         return {"ok": True}
 
@@ -77,6 +82,15 @@ class FakeSlackClient:
         return {"messages": msgs}
 
 
+class ApiCallOnlySlackClient:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def api_call(self, api_method, *, json=None, **kwargs):
+        self.calls.append({"api_method": api_method, "json": json})
+        return {"ok": True}
+
+
 def _target(thread="100.1"):
     return SurfaceTarget(
         surface="slack", workspace="w", agent="a", channel="C1", thread=thread
@@ -104,9 +118,33 @@ async def test_progress_status_uses_assistant_thread_indicator():
     await delivery.set_progress_status(_target(), "is thinking...")
 
     assert client.statuses == [
-        {"channel_id": "C1", "thread_ts": "100.1", "status": "is thinking..."}
+        {
+            "channel_id": "C1",
+            "thread_ts": "100.1",
+            "status": "is thinking...",
+            "loading_messages": ["is thinking..."],
+        }
     ]
     assert client.posted == []
+
+
+async def test_progress_status_fallback_sets_loading_messages():
+    client = ApiCallOnlySlackClient()
+    delivery = SlackSurfaceDelivery(client)
+
+    await delivery.set_progress_status(_target(), "is thinking...")
+
+    assert client.calls == [
+        {
+            "api_method": "assistant.threads.setStatus",
+            "json": {
+                "channel_id": "C1",
+                "thread_ts": "100.1",
+                "status": "is thinking...",
+                "loading_messages": ["is thinking..."],
+            },
+        }
+    ]
 
 
 async def test_progress_status_failure_is_non_blocking():

@@ -171,7 +171,10 @@ class SlackSurfaceDelivery:
             setter = getattr(self.client, "assistant_threads_setStatus", None)
             if setter is not None:
                 await setter(
-                    channel_id=target.channel, thread_ts=target.thread, status=text
+                    channel_id=target.channel,
+                    thread_ts=target.thread,
+                    status=text,
+                    loading_messages=[text],
                 )
             else:
                 await self.client.api_call(
@@ -180,6 +183,7 @@ class SlackSurfaceDelivery:
                         "channel_id": target.channel,
                         "thread_ts": target.thread,
                         "status": text,
+                        "loading_messages": [text],
                     },
                 )
         except Exception:  # noqa: BLE001 — status must never block delivery
